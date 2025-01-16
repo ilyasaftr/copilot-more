@@ -1,6 +1,13 @@
 import json
+from typing import Optional
 
-from aiohttp import ClientSession, ClientTimeout, TCPConnector
+from aiohttp import (
+    ClientSession,
+    ClientTimeout,
+    TCPConnector,
+    BasicAuth,
+    ClientResponse,
+)
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -8,7 +15,12 @@ from fastapi.responses import StreamingResponse
 from copilot_more.logger import logger
 from copilot_more.proxy import RECORD_TRAFFIC, get_proxy_url, initialize_proxy
 from copilot_more.token import get_cached_copilot_token
-from copilot_more.utils import StringSanitizer
+from copilot_more.utils import (
+    StringSanitizer,
+    generate_machine_id,
+    generate_session_id,
+    generate_request_id,
+)
 
 sanitizer = StringSanitizer()
 
@@ -123,6 +135,23 @@ async def create_client_session() -> ClientSession:
     return ClientSession(timeout=TIMEOUT, connector=connector)
 
 
+def get_base_headers(token_data: dict) -> dict:
+    """Get base headers for Copilot API requests"""
+    return {
+        "Authorization": f"Bearer {token_data['token']}",
+        "Content-Type": "application/json",
+        "copilot-integration-id": "vscode-chat",
+        "editor-plugin-version": "copilot-chat/0.23.2",
+        "editor-version": "vscode/1.96.3",
+        "openai-organization": "github-copilot",
+        "user-agent": "GitHubCopilotChat/0.23.2",
+        "vscode-machineid": generate_machine_id(),
+        "vscode-sessionid": generate_session_id(),
+        "x-github-api-version": "2024-12-15",
+        "x-request-id": generate_request_id(),
+    }
+
+
 @app.get("/models")
 async def list_models():
     """
@@ -132,16 +161,13 @@ async def list_models():
         token = await get_cached_copilot_token()
         session = await create_client_session()
         async with session as s:
-            kwargs = {
-                "headers": {
-                    "Authorization": f"Bearer {token['token']}",
-                    "Content-Type": "application/json",
-                    "editor-version": "vscode/1.95.3"
-                }
-            }
-            if RECORD_TRAFFIC:
-                kwargs["proxy"] = get_proxy_url()
-            async with s.get(MODELS_API_ENDPOINT, **kwargs) as response:
+            headers = get_base_headers(token)
+            headers["openai-intent"] = "model-access"
+
+            proxy = get_proxy_url() if RECORD_TRAFFIC else None
+            async with s.get(
+                MODELS_API_ENDPOINT, headers=headers, proxy=proxy
+            ) as response:
                 if response.status != 200:
                     error_message = await response.text()
                     logger.error(f"Models API error: {error_message}")
@@ -178,18 +204,21 @@ async def proxy_chat_completions(request: Request):
 
             session = await create_client_session()
             async with session as s:
-                kwargs = {
-                    "json": request_body,
-                    "headers": {
-                        "Authorization": f"Bearer {token['token']}",
-                        "Content-Type": "application/json",
+                headers = get_base_headers(token)
+                headers.update(
+                    {
                         "Accept": "text/event-stream",
-                        "editor-version": "vscode/1.95.3",
-                    },
-                }
-                if RECORD_TRAFFIC:
-                    kwargs["proxy"] = get_proxy_url()
-                async with s.post(CHAT_COMPLETIONS_API_ENDPOINT, **kwargs) as response:
+                        "openai-intent": "conversation-panel",
+                    }
+                )
+
+                proxy = get_proxy_url() if RECORD_TRAFFIC else None
+                async with s.post(
+                    CHAT_COMPLETIONS_API_ENDPOINT,
+                    json=request_body,
+                    headers=headers,
+                    proxy=proxy,
+                ) as response:
                     if response.status != 200:
                         error_message = await response.text()
                         logger.error(f"API error: {error_message}")
